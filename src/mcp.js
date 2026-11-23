@@ -15,6 +15,11 @@
  *
  * Transport: stdio. The HTTP transport needs a server-side SSE endpoint, a
  * session id and its own retry rules; stdio needs a pipe. Start with the pipe.
+ *
+ * A task that must not inherit this whole surface takes a scoped view over it
+ * in `./mcp/router.js` — owner-approved names, allowlist enforced at dispatch,
+ * every call dangerous and session-approved. Legacy (unscoped) behaviour here
+ * is unchanged.
  */
 import { spawn } from "node:child_process";
 import { config } from "./config.js";
@@ -24,6 +29,50 @@ const PROTOCOL_VERSION = "2025-06-18";
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_LINE_BYTES = 4 * 1024 * 1024; // a tool result, not an essay
 const RESTART_BACKOFF_MS = 5_000;
+
+/* ──────────────────────────── names and bounds ────────────────────────── */
+
+/**
+ * The `mcp__server__tool` namespace is only collision-safe if neither part can
+ * contain `__` itself: `mcp__a__b__c` would be server `a`'s tool `b__c` and
+ * server `a__b`'s tool `c` at once. Both parts are restricted to 1-64 of
+ * [A-Za-z0-9_-] with no double underscore, so the split is unambiguous and a
+ * third-party name can never shadow a built-in or another server's tool.
+ */
+export const MCP_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+export function isSafeMcpName(name) {
+  return typeof name === "string" && MCP_NAME_RE.test(name) && !name.includes("__");
+}
+
+export function mcpToolName(server, tool) {
+  if (!isSafeMcpName(server)) {
+    throw new Error(`MCP server name ${JSON.stringify(String(server).slice(0, 80))} must be 1-64 letters, digits, dash or underscore, without "__"`);
+  }
+  if (!isSafeMcpName(tool)) {
+    throw new Error(`MCP tool name ${JSON.stringify(String(tool).slice(0, 80))} must be 1-64 letters, digits, dash or underscore, without "__"`);
+  }
+  return `mcp__${server}__${tool}`;
+}
+
+/** Split a namespaced name back into its parts, or null when it is not one. */
+export function parseMcpToolName(name) {
+  const parts = String(name ?? "").split("__");
+  if (parts.length !== 3 || parts[0] !== "mcp") return null;
+  const [, server, tool] = parts;
+  return isSafeMcpName(server) && isSafeMcpName(tool) ? { server, tool } : null;
+}
+
+/** How much of a tool result one call may carry. A result, not an essay. */
+export const MCP_RESULT_CHAR_LIMIT = 12_000;
+
+/**
+ * Tool output is a prompt-injection surface like any other fetched text, so it
+ * travels wrapped in a marker the prompt and the guard can both see.
+ */
+export function labelUntrustedMcp(name, output) {
+  return `<untrusted-source tool="${name}">\n${output}\n</untrusted-source>`;
+}
 
 /* ──────────────────────────────── client ──────────────────────────────── */
 
@@ -168,7 +217,7 @@ export class McpClient {
       })
       .filter(Boolean)
       .join("\n")
-      .slice(0, 12_000);
+      .slice(0, MCP_RESULT_CHAR_LIMIT);
     return { ok: !result?.isError, output: text || "(the tool returned no text)" };
   }
 
@@ -229,12 +278,15 @@ const clients = new Map();
  *
  * The name is namespaced (`mcp__files__read_file`) so a third-party server can
  * never shadow a built-in tool — a server that ships a `shell` tool must not be
- * able to intercept calls meant for ours.
+ * able to intercept calls meant for ours. `mcpToolName` refuses names that
+ * would make that namespace ambiguous, so the split back into server and tool
+ * stays unambiguous for the task-scoped router in `./mcp/router.js`.
  */
 export function toQuasnoozeTool(client, definition) {
   const remoteName = definition.name;
+  const name = mcpToolName(client.name, remoteName);
   return {
-    name: `mcp__${client.name}__${remoteName}`,
+    name,
     description: `[${client.name} MCP server] ${definition.description || remoteName}`,
     parameters: definition.inputSchema || { type: "object", properties: {} },
     // Third-party code, unless the user said otherwise by name.
@@ -243,10 +295,7 @@ export function toQuasnoozeTool(client, definition) {
     async run(args) {
       const result = await client.callTool(remoteName, args || {});
       // Tool output is a prompt-injection surface like any other fetched text.
-      return {
-        ok: result.ok,
-        output: `<untrusted-source tool="mcp__${client.name}__${remoteName}">\n${result.output}\n</untrusted-source>`,
-      };
+      return { ok: result.ok, output: labelUntrustedMcp(name, result.output) };
     },
   };
 }
