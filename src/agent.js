@@ -21,6 +21,7 @@ import { createSources, addSource, listSources } from "./sources.js";
 import { validateCitations, renderSourceBlock } from "./citations.js";
 import { classifyCommand, describeTier, detectCommitProposal, READ as TIER_READ, BLOCKED as TIER_BLOCKED } from "./risk.js";
 import { POLICY_DECISIONS, resolveHarnessPipeline } from "./harness/events.js";
+import { isMcpTaskScope } from "./mcp/router.js";
 import { TOOL_MAP, DANGEROUS, toolSchemas, SafePathError, screenCommand } from "./tools.js";
 import { loadSession, appendMessage, loadMemory } from "./store.js";
 import { auditReply, renderGuardNote } from "./guard.js";
@@ -44,8 +45,12 @@ const approvals = new Map(); // id -> { resolve, timer, channel, description, cr
 /**
  * Create a permission prompt. Returns { id, promise } so the blocking
  * caller and the channel that draws the buttons share the same id.
+ *
+ * `sessionBound` ties the answer to `sessionId` alone: a scoped MCP call (issue
+ * #156) is approved in the session that owns its task scope, so a yes in some
+ * other conversation on the same channel must not reach it.
  */
-export function createApproval({ channel, sessionId = "", description, preview }) {
+export function createApproval({ channel, sessionId = "", description, preview, sessionBound = false }) {
   const secrets = [...previewSecrets(), config.authKey, config.llm.openaiKey, config.telegram.token, config.discord.token, config.slack.token];
   description = approvalDescription(description, secrets);
   preview = preview ? sanitizeActionPreview(preview, secrets) : undefined;
@@ -58,7 +63,7 @@ export function createApproval({ channel, sessionId = "", description, preview }
     }, APPROVAL_TIMEOUT_MS);
     // A prompt nobody answers must not be the only reason the process is alive.
     timer.unref?.();
-    entry = { resolve, timer, channel, sessionId, description, preview, createdAt: Date.now() };
+    entry = { resolve, timer, channel, sessionId, description, preview, createdAt: Date.now(), sessionBound: Boolean(sessionBound) };
     approvals.set(id, entry);
   });
   return { id, promise };
@@ -80,7 +85,9 @@ export function answerApproval(id, allowed) {
  * Matches on session first: two conversations on one channel (two Telegram
  * chats behind one bot, two browser tabs) both looked like "telegram", so a
  * yes in one could approve a command raised in the other. Falls back to the
- * channel when the caller has no session to offer.
+ * channel when the caller has no session to offer — but a session-bound prompt
+ * (a scoped MCP call) is never answered by that fallback: it belongs to its
+ * originating session and to no other.
  */
 export function answerApprovalFor({ sessionId, channel }, allowed) {
   if (sessionId) {
@@ -88,14 +95,15 @@ export function answerApprovalFor({ sessionId, channel }, allowed) {
       .filter(([, v]) => v.sessionId === sessionId)
       .sort((a, b) => b[1].createdAt - a[1].createdAt);
     if (entries.length) return answerApproval(entries[0][0], allowed);
+    return answerApprovalByChannel(channel, allowed, { excludeSessionBound: true });
   }
   return answerApprovalByChannel(channel, allowed);
 }
 
 /** @deprecated prefer answerApprovalFor — a channel is not an identity. */
-export function answerApprovalByChannel(channel, allowed) {
+export function answerApprovalByChannel(channel, allowed, { excludeSessionBound = false } = {}) {
   const entries = [...approvals.entries()]
-    .filter(([, v]) => v.channel === channel)
+    .filter(([, v]) => v.channel === channel && !(excludeSessionBound && v.sessionBound))
     .sort((a, b) => b[1].createdAt - a[1].createdAt);
   if (!entries.length) return false;
   return answerApproval(entries[0][0], allowed);
@@ -205,6 +213,9 @@ export function describeCall(name, args) {
  * @param {string} opts.text
  * @param {string} opts.channel
  * @param {(event: object) => void} [opts.onEvent] live progress for the UI
+ * @param {object} [opts.mcpScope] task-scoped MCP view from createMcpTaskScope;
+ *   when set, its allowlist is enforced at dispatch and every MCP call is
+ *   dangerous, session-approved and refused unattended (issue #156)
  */
 /**
  * A failed turn, said precisely.
@@ -354,6 +365,12 @@ export async function runAgent({
   autonomy = "interactive",
   allowSchedule = true,
   harness,
+  // Optional task-scoped MCP view (issue #156, ./mcp/router.js). When present,
+  // only its owner-approved names are offered or dispatchable, every MCP call
+  // is dangerous regardless of the legacy trusted opt-out, approvals belong to
+  // the scope's originating session, and unattended MCP calls are refused.
+  // Without it, MCP behaviour is exactly what it has always been.
+  mcpScope = null,
   signal,
   // Latency marks, owned by whoever can see the clock they are measured against.
   // `stages` is mutated in place by the caller (the HTTP layer marks the first
@@ -363,6 +380,9 @@ export async function runAgent({
   stageAnchor = null,
 }) {
   const activeHarness = resolveHarnessPipeline(harness, config.harnessEvents);
+  if (mcpScope != null && !isMcpTaskScope(mcpScope)) {
+    throw new Error("runAgent: mcpScope must be a task scope from createMcpTaskScope (src/mcp/router.js)");
+  }
   const turnSecrets = () => [
     ...previewSecrets(),
     config.authKey,
@@ -665,7 +685,10 @@ export async function runAgent({
       // usually produce no text, so this costs nothing when it does not apply.
       out = await brain.chat(messages, {
         selection: activeModel,
-        tools: social ? [] : toolSchemas(),
+        // A task-scoped view narrows what the model is even shown (issue #156):
+        // out-of-scope MCP tools are not offered, and the dispatch gate below
+        // refuses them again if the model fabricates the call anyway.
+        tools: social ? [] : mcpScope ? mcpScope.filterSchemas(toolSchemas()) : toolSchemas(),
         ...(social ? {maxTokens:128,think:false} : {}),
         ...(activeHarness
           ? {
@@ -703,14 +726,42 @@ export async function runAgent({
     messages.push({ role: "assistant", content: out.content || "", toolCalls: out.toolCalls });
 
     for (const call of out.toolCalls) {
-      const tool = TOOL_MAP.get(call.name);
+      // Task-scoped MCP view (issue #156): the owner-approved allowlist is
+      // enforced here at dispatch, not only in the offered schemas. A filtered
+      // or spoofed server/tool — including one fabricated by model output — is
+      // refused with zero server calls and no global name list to fish from.
+      const wantsMcp = mcpScope !== null && String(call.name).startsWith("mcp__");
+      const scopedTool = wantsMcp && mcpScope.has(call.name) ? mcpScope.toolFor(call.name) : null;
+      if (wantsMcp && !scopedTool) {
+        const why = `Refused: ${call.name} is outside this task's approved MCP scope (${mcpScope.names.join(", ") || "no MCP tools"}). Nothing was called.`;
+        messages.push({ role: "tool", name: call.name, toolCallId: call.id, content: why });
+        trace.push({ tool: call.name, args: call.arguments, ok: false, denied: true, reason: "out-of-scope" });
+        onEvent({ type: "tool_done", name: call.name, ok: false, preview: why.slice(0, 200) });
+        continue;
+      }
+      const tool = scopedTool || TOOL_MAP.get(call.name);
       const label = describeCall(call.name, call.arguments);
 
       if (!tool) {
+        // In scoped mode the model is told the scoped names, not the registry's
+        // whole global surface — an unknown call must not leak what is filtered.
+        const available = mcpScope
+          ? [...TOOL_MAP.keys()].filter((n) => !n.startsWith("mcp__") || mcpScope.has(n))
+          : [...TOOL_MAP.keys()];
         messages.push({
           role: "tool", name: call.name, toolCallId: call.id,
-          content: `No such tool: ${call.name}. Available: ${[...TOOL_MAP.keys()].join(", ")}`,
+          content: `No such tool: ${call.name}. Available: ${available.join(", ")}`,
         });
+        continue;
+      }
+
+      // A malformed server schema is a bounded refusal before any gate: there
+      // is nothing an approval could authorise, so do not ask for one.
+      if (scopedTool?.schemaMalformed) {
+        const why = `Refused: the schema ${scopedTool.mcp.server} advertises for "${scopedTool.mcp.tool}" is malformed, so the call was not sent.`;
+        messages.push({ role: "tool", name: call.name, toolCallId: call.id, content: why });
+        trace.push({ tool: call.name, args: call.arguments, ok: false, denied: true, reason: "malformed-schema" });
+        onEvent({ type: "tool_done", name: call.name, ok: false, preview: why.slice(0, 200) });
         continue;
       }
 
@@ -834,6 +885,7 @@ export async function runAgent({
       if (
         unattended &&
         (DANGEROUS.has(tool.name) ||
+          scopedTool ||
           commitProposal.isCommit ||
           (tool.name === "schedule" && !allowSchedule) ||
           policyDecision !== POLICY_DECISIONS.CONTINUE)
@@ -866,7 +918,12 @@ export async function runAgent({
         continue;
       }
 
-      const baselineMustAsk = DANGEROUS.has(tool.name) && !config.autoApprove && tier?.tier !== TIER_READ;
+      // Scoped MCP calls (issue #156) are dangerous regardless of the legacy
+      // trusted opt-out — and they ask even under PINCH_AUTO_APPROVE, because
+      // scoped mode's contract is originating-session approval, full stop.
+      const baselineMustAsk = scopedTool
+        ? true
+        : DANGEROUS.has(tool.name) && !config.autoApprove && tier?.tier !== TIER_READ;
       const policyMustAsk =
         policyDecision === POLICY_DECISIONS.ASK ||
         (commitProposal.isCommit && (!config.autoApprove || Boolean(activeHarness)));
@@ -881,7 +938,15 @@ export async function runAgent({
         const secrets = turnSecrets();
         const preview = buildActionPreview(tool.name, call.arguments, { risk: tier || classifiedShell, secrets });
         const description = approvalDescription(label, secrets);
-        const approval = createApproval({ channel, sessionId, description, preview });
+        // A scoped MCP approval belongs to the session that owns the task
+        // scope, and only that session can answer it.
+        const approval = createApproval({
+          channel,
+          sessionId: scopedTool ? mcpScope.sessionId : sessionId,
+          description,
+          preview,
+          ...(scopedTool ? { sessionBound: true } : {}),
+        });
         onEvent({ type: "approval", id: approval.id, description, preview });
         const allowed = await awaitApprovalWithSignal(approval, signal);
         if (signal?.aborted) {
@@ -917,7 +982,12 @@ export async function runAgent({
         // Let evidence-producing tools avoid registering passages the model
         // cannot see because the remaining tool-output budget is exhausted.
         ctx.toolOutputLimit = Math.min(12_000, Math.max(0, toolBudget));
-        result = await tool.run(call.arguments || {}, ctx);
+        // Scoped MCP calls go through the scope's dispatch, which enforces the
+        // allowlist again and bounds crash/oversize failures; every other tool
+        // runs exactly as it always has.
+        result = scopedTool
+          ? await mcpScope.dispatch({ name: call.name, args: call.arguments || {}, autonomy })
+          : await tool.run(call.arguments || {}, ctx);
       } catch (err) {
         result = {
           ok: false,
